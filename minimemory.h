@@ -7,8 +7,9 @@
 #ifndef MINIMEMORY_MINIMEMORY_H_
 #define MINIMEMORY_MINIMEMORY_H_
 
-#include "../mbed.h"
-
+#ifdef __MBED__
+#	include "../mbed.h"
+#endif
 typedef struct {
 		bool      initialized;
 		uint8_t   *memoryPool;
