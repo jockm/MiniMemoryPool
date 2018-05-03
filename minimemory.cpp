@@ -1,4 +1,10 @@
-#include "../mbed.h"
+#ifdef __MBED__
+#	include "../mbed.h"
+#else
+#	include <stdlib.h>
+#	include <string.h>
+#endif
+
 #include "minimemory.h"
 
 static void *expandPool(MiniMemoryPool *pool, uint16_t sz)
@@ -25,9 +31,9 @@ void mmpReset(MiniMemoryPool *pool)
 // and may have been modified
 ///////////////////////////////////////////////////////////////////////
 
-void mmpInit(MiniMemoryPool *pool, uint8_t *memPool, uint16_t poolSize)
+void mmpInit(MiniMemoryPool *pool, void *memPool, uint16_t poolSize)
 {
-	pool->memoryPool = memPool;
+	pool->memoryPool = (uint8_t *) memPool;
 	pool->poolSize = poolSize;
 	pool->memTop = 0;
 
@@ -56,8 +62,8 @@ void mmpFree(MiniMemoryPool *pool, void *firstbyte)
 {
 	MemoryControlBlock *mcb;
 
-	mcb = (struct memoryControlBlock *) ((uint8_t *) firstbyte
-			- sizeof(struct memoryControlBlock));
+	mcb = (MemoryControlBlock *) ((uint8_t *) firstbyte
+			- sizeof(MemoryControlBlock));
 	mcb->available = true;
 
 	return;
@@ -78,7 +84,7 @@ void *mmpMalloc(MiniMemoryPool *pool, uint16_t numbytes)
 	// The memory we search for has to include the memory
 	// control block, but the user of malloc doesn't need
 	// to know this, so we'll just add it in for them.
-	numbytes = numbytes + sizeof(struct memoryControlBlock);
+	numbytes = numbytes + sizeof(MemoryControlBlock);
 
 	// Set memory_location to 0 until we find a suitable * location
 	memoryLocation = 0;
@@ -93,7 +99,7 @@ void *mmpMalloc(MiniMemoryPool *pool, uint16_t numbytes)
 		// is of the correct type so we can use it as a struct.
 		// current_location is a void pointer so we can use it
 		// to calculate addresses.
-		currentLocationMcb = (struct memoryControlBlock *) currentLocation;
+		currentLocationMcb = (MemoryControlBlock *) currentLocation;
 
 		if(currentLocationMcb->available) {
 			if(currentLocationMcb->size >= numbytes) {
@@ -139,7 +145,7 @@ void *mmpMalloc(MiniMemoryPool *pool, uint16_t numbytes)
 	// the mem_control_block
 	// Move the pointer past the mem_control_block
 	memoryLocation = ((uint8_t *) memoryLocation)
-			+ sizeof(struct memoryControlBlock);
+			+ sizeof(MemoryControlBlock);
 
 	// Return the pointer
 	return memoryLocation;
@@ -168,8 +174,8 @@ void *mmpRealloc(MiniMemoryPool *pool, void *ptr, uint16_t numbytes)
 
 	MemoryControlBlock *mcb;
 
-	mcb = (struct memoryControlBlock *) ((uint8_t *) ptr
-			- sizeof(struct memoryControlBlock));
+	mcb = (MemoryControlBlock *) ((uint8_t *) ptr
+			- sizeof(MemoryControlBlock));
 
 	// if they are requesting a size smaller than their current size,
 	// then leave.
