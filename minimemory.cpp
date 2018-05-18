@@ -1,213 +1,258 @@
 #ifdef __MBED__
 #	include "../mbed.h"
 #else
+#	include <stdio.h>
 #	include <stdlib.h>
 #	include <string.h>
 #endif
 
 #include "minimemory.h"
 
-static void *expandPool(MiniMemoryPool *pool, uint16_t sz)
+// MEMMGR_H//----------------------------------------------------------------
+// Statically-allocated memory manager
+//
+// by Eli Bendersky (eliben@gmail.com)
+//
+// This code is in the public domain.
+//----------------------------------------------------------------
+#include <stdio.h>
+//#include "memmgr.h"
+
+
+void mmpInit(MiniMemoryPool *appletMem, uint8_t *memForPool, uint32_t pSize)
 {
-	if(pool->memTop + sz >= pool->poolSize) {
-		return NULL;
+	appletMem->poolSize = pSize;
+	appletMem->pool = memForPool;
+
+	appletMem->base.s.next = 0;
+	appletMem->base.s.size = 0;
+	appletMem->freep = 0;
+	appletMem->pool_free_pos = 0;
+}
+
+
+//void memmgr_print_stats()
+//{
+//    #ifdef DEBUG_MEMMGR_SUPPORT_STATS
+//    mem_header_t* p;
+//
+//    printf("------ Memory manager stats ------\n\n");
+//    printf(    "Pool: free_pos = %lu (%lu bytes left)\n\n",
+//    		appletMem->pool_free_pos, POOL_SIZE - appletMem->pool_free_pos);
+//
+//    p = (mem_header_t*) appletMem->pool;
+//
+//    while (p < (mem_header_t*) (appletMem->pool + appletMem->pool_free_pos))
+//    {
+//        printf(    "  * Addr: %p; Size: %8lu\n",
+//                p, p->s.size);
+//
+//        p += p->s.size;
+//    }
+//
+//    printf("\nFree list:\n\n");
+//
+//    if (appletMem->freep)
+//    {
+//        p = appletMem->freep;
+//
+//        while (1)
+//        {
+//            printf(    "  * Addr: %p; Size: %8lu; Next: %p\n",
+//                    p, p->s.size, p->s.next);
+//
+//            p = p->s.next;
+//
+//            if (p == appletMem->freep)
+//                break;
+//        }
+//    }
+//    else
+//    {
+//        printf("Empty\n");
+//    }
+//
+//    printf("\n");
+//    #endif // DEBUG_MEMMGR_SUPPORT_STATS
+//}
+
+static MmpHeader* get_mem_from_pool(MiniMemoryPool *appletMem, uint32_t nquantas)
+{
+    uint32_t total_req_size;
+
+    MmpHeader* h;
+
+    if (nquantas < MMP_MIN_POOL_ALLOC_QUANTAS)
+        nquantas = MMP_MIN_POOL_ALLOC_QUANTAS;
+
+    total_req_size = nquantas * sizeof(MmpHeader);
+
+    if (appletMem->pool_free_pos + total_req_size <= appletMem->poolSize)
+    {
+        h = (MmpHeader*) (appletMem->pool + appletMem->pool_free_pos);
+        h->s.size = nquantas;
+        mmpFree(appletMem, (void*) (h + 1));
+        appletMem->pool_free_pos += total_req_size;
+    }
+    else
+    {
+        return 0;
+    }
+
+    return appletMem->freep;
+}
+
+
+// Allocations are done in 'quantas' of header size.
+// The search for a free block of adequate size begins at the point 'freep'
+// where the last block was found.
+// If a too-big block is found, it is split and the tail is returned (this
+// way the header of the original needs only to have its size adjusted).
+// The pointer returned to the user points to the free space within the block,
+// which begins one quanta after the header.
+//
+void* mmpMalloc(MiniMemoryPool *appletMem, uint32_t nbytes)
+{
+    MmpHeader* p;
+    MmpHeader* prevp;
+
+    // Calculate how many quantas are required: we need enough to house all
+    // the requested bytes, plus the header. The -1 and +1 are there to make sure
+    // that if nbytes is a multiple of nquantas, we don't allocate too much
+    //
+    uint32_t nquantas = (nbytes + sizeof(MmpHeader) - 1) / sizeof(MmpHeader) + 1;
+
+    // First alloc call, and no free list yet ? Use 'base' for an initial
+    // denegerate block of size 0, which points to itself
+    //
+    if ((prevp = appletMem->freep) == 0)
+    {
+    	appletMem->base.s.next = appletMem->freep = prevp = &appletMem->base;
+    	appletMem->base.s.size = 0;
+    }
+
+    for (p = prevp->s.next; ; prevp = p, p = p->s.next)
+    {
+        // big enough ?
+        if (p->s.size >= nquantas)
+        {
+            // exactly ?
+            if (p->s.size == nquantas)
+            {
+                // just eliminate this block from the free list by pointing
+                // its prev's next to its next
+                //
+                prevp->s.next = p->s.next;
+            }
+            else // too big
+            {
+                p->s.size -= nquantas;
+                p += p->s.size;
+                p->s.size = nquantas;
+            }
+
+            appletMem->freep = prevp;
+            return (void*) (p + 1);
+        }
+        // Reached end of free list ?
+        // Try to allocate the block from the pool. If that succeeds,
+        // get_mem_from_pool adds the new block to the free list and
+        // it will be found in the following iterations. If the call
+        // to get_mem_from_pool doesn't succeed, we've run out of
+        // memory
+        //
+        else if (p == appletMem->freep)
+        {
+            if ((p = get_mem_from_pool(appletMem, nquantas)) == 0)
+            {
+                #ifdef DEBUG_MEMMGR_FATAL
+                printf("!! Memory allocation failed !!\n");
+                #endif
+                return 0;
+            }
+        }
+    }
+}
+
+
+// Scans the free list, starting at freep, looking the the place to insert the
+// free block. This is either between two existing blocks or at the end of the
+// list. In any case, if the block being freed is adjacent to either neighbor,
+// the adjacent blocks are combined.
+//
+void mmpFree(MiniMemoryPool *appletMem, void* ap)
+{
+	if(ap == NULL) {
+		return;
 	}
+    MmpHeader* block;
+    MmpHeader* p;
 
-	uint16_t ret = pool->memTop;
-	pool->memTop += sz;
+    // acquire pointer to block header
+    block = ((MmpHeader*) ap) - 1;
 
-	char *p = (char *) &pool->memoryPool[ret];
-	return (void *) p;
+    // Find the correct place to place the block in (the free list is sorted by
+    // address, increasing order)
+    //
+    for (p = appletMem->freep; !(block > p && block < p->s.next); p = p->s.next)
+    {
+        // Since the free list is circular, there is one link where a
+        // higher-addressed block points to a lower-addressed block.
+        // This condition checks if the block should be actually
+        // inserted between them
+        //
+        if (p >= p->s.next && (block > p || block < p->s.next))
+            break;
+    }
+
+    // Try to combine with the higher neighbor
+    //
+    if (block + block->s.size == p->s.next)
+    {
+        block->s.size += p->s.next->s.size;
+        block->s.next = p->s.next->s.next;
+    }
+    else
+    {
+        block->s.next = p->s.next;
+    }
+
+    // Try to combine with the lower neighbor
+    //
+    if (p + p->s.size == block)
+    {
+        p->s.size += block->s.size;
+        p->s.next = block->s.next;
+    }
+    else
+    {
+        p->s.next = block;
+    }
+
+    appletMem->freep = p;
 }
 
-void mmpReset(MiniMemoryPool *pool)
-{
-	mmpInit(pool, pool->memoryPool, pool->poolSize);
-}
 
-///////////////////////////////////////////////////////////////////////
-// All code from below this comment based on:
-//     https://www.ibm.com/developerworks/jp/linux/library/l-memory/
-// and may have been modified
-///////////////////////////////////////////////////////////////////////
-
-void mmpInit(MiniMemoryPool *pool, void *memPool, uint16_t poolSize)
-{
-	pool->memoryPool = (uint8_t *) memPool;
-	pool->poolSize = poolSize;
-	pool->memTop = 0;
-
-	// get the last valid address from the OS
-	pool->lastValidAddress = expandPool(pool, 0);
-
-	// we don't have any memory to manage yet, so
-	// just set the beginning to be last_valid_address
-	pool->memoryStart = pool->lastValidAddress;
-
-	// Okay, we're initialized and ready to go
-	pool->initialized = true;
-
-	memset(pool->memoryPool, 0, pool->poolSize);
-}
-
-// TODO JEM: Condense this into a single 16 bit word with the high bit
-// being a flag
-typedef struct _memoryControlBlock
-{
-		bool available;
-		uint16_t size;
-} MemoryControlBlock;
-
-void mmpFree(MiniMemoryPool *pool, void *firstbyte)
-{
-	MemoryControlBlock *mcb;
-
-	mcb = (MemoryControlBlock *) ((uint8_t *) firstbyte
-			- sizeof(MemoryControlBlock));
-	mcb->available = true;
-
-	return;
-}
-
-void *mmpMalloc(MiniMemoryPool *pool, uint16_t numbytes)
-{
-	// Holds where we are looking in memory
-	void *currentLocation;
-
-	// This is the same as current_location, but cast to a * memory_control_block
-	MemoryControlBlock *currentLocationMcb;
-
-	// This is the memory location we will return.
-	//It will * be set to 0 until we find something suitable
-	void *memoryLocation;
-
-	// The memory we search for has to include the memory
-	// control block, but the user of malloc doesn't need
-	// to know this, so we'll just add it in for them.
-	numbytes = numbytes + sizeof(MemoryControlBlock);
-
-	// Set memory_location to 0 until we find a suitable * location
-	memoryLocation = 0;
-
-	// Begin searching at the start of managed memory
-	currentLocation = pool->memoryStart;
-
-	// Keep going until we have searched all allocated space
-	while(currentLocation != pool->lastValidAddress) {
-		// current_location and current_location_mcb point
-		// to the same address.  However, current_location_mcb
-		// is of the correct type so we can use it as a struct.
-		// current_location is a void pointer so we can use it
-		// to calculate addresses.
-		currentLocationMcb = (MemoryControlBlock *) currentLocation;
-
-		if(currentLocationMcb->available) {
-			if(currentLocationMcb->size >= numbytes) {
-				// Woohoo!  We've found an open, * appropriately-size location.
-				// It is no longer available
-				currentLocationMcb->available = false;
-
-				// We own it
-				memoryLocation = currentLocation;
-
-				// Leave the loop
-				break;
-			}
-		}
-
-		// If we made it here, it's because the Current memory
-		// block not suitable, move to the next one
-		currentLocation = ((uint8_t *) currentLocation)
-				+ currentLocationMcb->size;
-	}
-
-	// If we still don't have a valid location, we'll
-	// have to ask the operating system for more memory
-	if(!memoryLocation) {
-		// Move the program break numbytes further
-		expandPool(pool, numbytes);
-
-		// The new memory will be where the last valid * address left off
-		memoryLocation = pool->lastValidAddress;
-
-		// We'll move the last valid address forward * numbytes
-		pool->lastValidAddress = ((uint8_t *) pool->lastValidAddress)
-				+ numbytes;
-
-		// We need to initialize the mem_control_block
-		currentLocationMcb = (MemoryControlBlock *) memoryLocation;
-		currentLocationMcb->available = false;
-		currentLocationMcb->size = numbytes;
-	}
-
-	// Now, no matter what (well, except for error conditions),
-	// memory_location has the address of the memory, including
-	// the mem_control_block
-	// Move the pointer past the mem_control_block
-	memoryLocation = ((uint8_t *) memoryLocation)
-			+ sizeof(MemoryControlBlock);
-
-	// Return the pointer
-	return memoryLocation;
-}
-
-///////////////////////////////////////////////////////////////////////
-// End of code based on:
-//     https://www.ibm.com/developerworks/jp/linux/library/l-memory/
-///////////////////////////////////////////////////////////////////////
-
-void *mmpRealloc(MiniMemoryPool *pool, void *ptr, uint16_t numbytes)
+void* mmpRealloc(MiniMemoryPool *appletMem, void *ptr, uint32_t size)
 {
 	// If the pointer is null, we are just a malloc
-	if(!ptr)
+	if(ptr == NULL)
 	{
-		void *ret = mmpMalloc(pool, numbytes);
+		void *ret =mmpMalloc(appletMem, size);
 		return ret;
 	}
 
 	// if the size is zero, we are just a free
-	if(numbytes == 0) {
-		mmpFree(pool, ptr);
+	if(size == 0) {
+		mmpFree(appletMem, ptr);
 		return NULL;
 	}
 
-
-	MemoryControlBlock *mcb;
-
-	mcb = (MemoryControlBlock *) ((uint8_t *) ptr
-			- sizeof(MemoryControlBlock));
-
-	// if they are requesting a size smaller than their current size,
-	// then leave.
-	// TODO check if the delta is above a certain threshold and recover space
-	if(numbytes <= mcb->size) {
-		return ptr;
+	void *ret = mmpMalloc(appletMem, size);
+	if(ret) {
+		memcpy(ret, ptr, size);
+		mmpFree(appletMem, ptr);
 	}
 
-	// With all that out of the way, see if we can expand the pool in place
-	// or if we have to allocate and copy
-
-	uint16_t oldLen = mcb->size;
-	uint16_t allocDelta = numbytes = oldLen;
-	uint8_t *allocTop = ((uint8_t *) ptr) + (oldLen - 1);
-
-	bool canExpand = allocTop == pool->lastValidAddress;
-
-	if(canExpand) {
-		void *tPtr = expandPool(pool, allocDelta);
-		if(tPtr == NULL) {
-			return NULL;
-		}
-
-		pool->lastValidAddress = expandPool(pool, 0);
-
-		return ptr;
-	} else {
-		void *ret = mmpMalloc(pool, numbytes);
-		if(ret) {
-			memcpy(ret, ptr, oldLen);
-			mmpFree(pool, ptr);
-		}
-		return ret;
-	}
+	return ret;
 }
