@@ -172,6 +172,9 @@ void* mmpMalloc(MiniMemoryPool *appletMem, uint32_t nbytes)
             }
         }
     }
+
+    return NULL;
+
 }
 
 
